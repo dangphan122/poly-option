@@ -1,3 +1,4 @@
+Academic_paper.md
 # Arbitraging the Optimism Tax: A High-Frequency Quantitative Framework for Prediction Market Inefficiencies
 
 **Abstract**
