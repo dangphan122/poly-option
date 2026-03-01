@@ -1,0 +1,10 @@
+timestamp,event_type,position_id,event_name,strike,side,order_type,tokens,entry_price,exit_price,invested_usd,realized_pnl_usd,roi_pct,entry_edge_pct,entry_reason,close_reason,runtime_min
+2026-03-01T03:10:18.177237+00:00,OPEN,22c6031c,Bitcoin above ___ on March 1?,72000,YES,TAKER_FAK,564.00,0.0150,,8.46,,,4.23,edge=4.2% w=0.020 iv=98.0%,,
+2026-03-01T03:12:52.043592+00:00,OPEN,bcf1a6bf,Bitcoin above ___ on March 1?,72000,YES,TAKER_FAK,792.19,0.0150,,11.88,,,4.35,edge=4.4% w=0.021 iv=98.0%,,
+2026-03-01T03:13:18.905962+00:00,OPEN,0fdad7b0,Bitcoin above ___ on March 6?,72000,YES,MAKER_POST_ONLY,69.89,0.1620,,11.32,,,1.65,edge=1.6% w=0.010 iv=57.4%,,
+2026-03-01T03:13:20.362565+00:00,OPEN,a415eccd,Bitcoin above ___ on March 6?,72000,YES,MAKER_POST_ONLY,68.34,0.1620,,11.07,,,1.61,edge=1.6% w=0.010 iv=57.3%,,
+2026-03-01T03:13:32.472693+00:00,OPEN,bcf7c29d,Bitcoin above ___ on March 6?,72000,YES,MAKER_POST_ONLY,65.40,0.1620,,10.59,,,1.60,edge=1.6% w=0.010 iv=57.2%,,
+2026-03-01T03:13:36.516789+00:00,OPEN,06c3ea01,Bitcoin above ___ on March 6?,72000,YES,MAKER_POST_ONLY,67.73,0.1620,,10.97,,,1.66,edge=1.7% w=0.010 iv=57.2%,,
+2026-03-01T03:13:43.599543+00:00,OPEN,48f24551,Bitcoin above ___ on March 6?,72000,YES,MAKER_POST_ONLY,56.05,0.1620,,9.08,,,1.37,edge=1.4% w=0.008 iv=57.1%,,
+2026-03-01T03:13:54.279623+00:00,OPEN,3a579257,Bitcoin above ___ on March 6?,72000,YES,MAKER_POST_ONLY,56.02,0.1620,,9.08,,,1.37,edge=1.4% w=0.008 iv=57.1%,,
+2026-03-01T03:28:55.338913+00:00,OPEN,213bb1df,Bitcoin above ___ on March 1?,70000,YES,TAKER_FAK,67.35,0.0850,,5.72,,,4.30,edge=4.3% w=0.006 iv=79.4%,,
