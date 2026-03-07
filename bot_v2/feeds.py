@@ -120,8 +120,12 @@ class DeribitOracle:
     """Fetches Deribit IV and computes N(d2) probabilities."""
 
     def __init__(self):
-        self.targets = {}   # {end_ts: set(strikes)}
-        self.latest = {}    # {end_ts: {spot, t_years, probabilities}}
+        self.targets = {}         # {end_ts: set(strikes)}
+        self.latest = {}          # {end_ts: {spot, t_years, probabilities}} (dashboard compat)
+        # Per-bracket IV lookup state
+        self.spot_price = 0.0
+        self.future_expiries = []  # sorted [(datetime, expiry_code)]
+        self.raw_iv_cache = {}     # {expiry_code: {strike: mark_iv (0-1 float)}}
         self._running = False
 
     def update_targets(self, targets):
@@ -174,41 +178,73 @@ class DeribitOracle:
             except: pass
         future.sort()
 
+        # ── Build raw_iv_cache: {expiry_code: {strike: mark_iv}} ──────────
+        all_strikes = set()
+        for s in self.targets.values(): all_strikes.update(s)
+
+        raw_cache = {}
+        for item in results:
+            m = _INST_RE.match(item.get("instrument_name", ""))
+            if not m or m.group(3) != "C": continue
+            exp_code = m.group(1)
+            try: strike = int(m.group(2))
+            except: continue
+            if strike not in all_strikes: continue
+
+            raw_iv = item.get("mark_iv")
+            if raw_iv is None or raw_iv <= 0: continue
+
+            # Liquidity filter
+            oi = item.get("open_interest", 0)
+            ask_iv_r = item.get("ask_iv", 0)
+            bid_iv_r = item.get("bid_iv", 0)
+            if oi == 0: continue
+            if ask_iv_r and bid_iv_r and (ask_iv_r - bid_iv_r) / 100.0 > 0.15: continue
+
+            if exp_code not in raw_cache: raw_cache[exp_code] = {}
+            raw_cache[exp_code][strike] = raw_iv / 100.0
+
+        # Update instance state atomically
+        self.spot_price = spot
+        self.future_expiries = future      # [(datetime, expiry_code)]
+        self.raw_iv_cache = raw_cache
+
+        # ── Build backwards-compat 'latest' for dashboard ───────────────
+        # Probabilities are intentionally empty here; computed live per-bracket in bot.py
         out = {}
         for exp_ts, strikes in self.targets.items():
             poly_exp = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
             t_years = (poly_exp - now).total_seconds() / SECONDS_PER_YEAR
-
             active = None
             if future:
                 poly_date = poly_exp.date()
                 for dt, s in future:
                     if dt.date() >= poly_date:
                         active = self._norm_exp(s); break
-                if not active:
-                    active = self._norm_exp(future[0][1])
-
-            probs = {}
-            if active:
-                for item in results:
-                    m = _INST_RE.match(item.get("instrument_name", ""))
-                    if not m or m.group(3) != "C" or m.group(1) != active:
-                        continue
-                    strike = int(m.group(2))
-                    if strike not in strikes: continue
-                    raw_iv = item.get("mark_iv")
-                    if raw_iv is None or raw_iv <= 0: continue
-                    iv = raw_iv / 100.0
-                    p_yes = self._nd2(spot, strike, iv, t_years)
-                    probs[strike] = {"mark_iv": round(iv, 6),
-                                     "p_real_yes": round(p_yes, 6),
-                                     "p_real_no": round(1.0-p_yes, 6)}
-
-            out[exp_ts] = {"spot_price": round(spot, 2),
-                           "t_years": round(t_years, 8),
-                           "deribit_expiry": active,
-                           "probabilities": probs}
+                if not active: active = self._norm_exp(future[0][1])
+            out[exp_ts] = {"spot_price": round(spot, 2), "t_years": round(t_years, 8),
+                           "deribit_expiry": active, "probabilities": {}}
         return out
+
+    def get_iv_for_date(self, target_dt, strike):
+        """
+        Strict per-bracket IV lookup.
+        Selects the Deribit expiry whose DATE >= target_dt.date(),
+        returns (mark_iv, expiry_code) or (None, None).
+        """
+        if not self.future_expiries or not self.raw_iv_cache:
+            return None, None
+        target_date = target_dt.date() if hasattr(target_dt, "date") else target_dt
+        # Find nearest Deribit expiry on or after the Polymarket resolution date
+        chosen_code = None
+        for dt, code in self.future_expiries:
+            if dt.date() >= target_date:
+                chosen_code = code
+                break
+        if chosen_code is None:
+            chosen_code = self.future_expiries[-1][1]  # fallback: furthest available
+        iv = self.raw_iv_cache.get(chosen_code, {}).get(strike)
+        return iv, chosen_code
 
     async def run(self, poll_sec=5):
         self._running = True
@@ -277,7 +313,7 @@ def _parse_event_markets(ev, seen, now):
     return brackets
 
 
-def discover_bracket_events():
+async def discover_bracket_events(session):
     now = time.time()
     brackets, seen = [], set()
     today = datetime.now(timezone.utc)
@@ -285,21 +321,22 @@ def discover_bracket_events():
         d = today + timedelta(days=delta)
         slug = f"bitcoin-above-on-{d.strftime('%B').lower()}-{d.day}"
         try:
-            r = requests.get(GAMMA_URL, params={"slug": slug, "limit": "1"},
-                             headers=UA, timeout=10)
-            r.raise_for_status()
-            for ev in r.json():
-                brackets.extend(_parse_event_markets(ev, seen, now))
+            async with session.get(GAMMA_URL, params={"slug": slug, "limit": "1"}, headers=UA, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                r.raise_for_status()
+                data = await r.json()
+                for ev in data:
+                    brackets.extend(_parse_event_markets(ev, seen, now))
         except: continue
     for params in [
         {"tag": "bitcoin", "active": "true", "closed": "false", "limit": "50"},
         {"tag": "crypto", "active": "true", "closed": "false", "limit": "100"},
     ]:
         try:
-            r = requests.get(GAMMA_URL, params=params, headers=UA, timeout=15)
-            r.raise_for_status()
-            for ev in r.json():
-                brackets.extend(_parse_event_markets(ev, seen, now))
+            async with session.get(GAMMA_URL, params=params, headers=UA, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                r.raise_for_status()
+                data = await r.json()
+                for ev in data:
+                    brackets.extend(_parse_event_markets(ev, seen, now))
         except: continue
     brackets.sort(key=lambda b: (b.end_ts, b.strike))
     return brackets
@@ -323,17 +360,20 @@ class PolymarketFeed:
         now = time.time()
         return [b for b in self.brackets if b.end_ts > now]
 
-    def refresh(self):
-        self.brackets = discover_bracket_events()
+    async def refresh(self, session):
+        self.brackets = await discover_bracket_events(session)
         log.info("Discovered %d brackets", len(self.brackets))
         return len(self.brackets) > 0
 
     async def run(self):
         self._running = True
-        self.refresh()
-        await asyncio.gather(
-            self._ws_poly(), self._ws_bnc(),
-            self._poll_books(), self._refresh_loop())
+        ssl_ctx = ssl.create_default_context()
+        conn = aiohttp.TCPConnector(resolver=_ManualResolver(), ssl=ssl_ctx, limit=20, force_close=True)
+        async with aiohttp.ClientSession(connector=conn) as session:
+            await self.refresh(session)
+            await asyncio.gather(
+                self._ws_poly(), self._ws_bnc(),
+                self._poll_books(session), self._refresh_loop(session))
 
     async def _ws_poly(self):
         while self._running:
@@ -412,37 +452,35 @@ class PolymarketFeed:
             self.bnc_ok = False
             if self._running: await asyncio.sleep(3)
 
-    async def _poll_books(self):
+    async def _poll_books(self, session):
         await asyncio.sleep(8)
         while self._running:
             for br in self.brackets:
                 if not self._running: break
                 for tid in [br.yes_tid, br.no_tid]:
                     try:
-                        r = requests.get(f"{CLOB_URL}/book",
-                                         params={"token_id": tid},
-                                         headers=UA, timeout=5)
-                        r.raise_for_status()
-                        data = r.json()
-                        bk = Book()
-                        for b in data.get("bids", []):
-                            p = str(b.get("price","0"))
-                            s = float(b.get("size",0))
-                            if float(p)>0 and s>0: bk.bids[p] = s
-                        for a in data.get("asks", []):
-                            p = str(a.get("price","0"))
-                            s = float(a.get("size",0))
-                            if float(p)>0 and s>0: bk.asks[p] = s
-                        bk.ts = time.time()
-                        self.books[tid] = bk
+                        async with session.get(f"{CLOB_URL}/book", params={"token_id": tid}, headers=UA, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                            r.raise_for_status()
+                            data = await r.json()
+                            bk = Book()
+                            for b in data.get("bids", []):
+                                p = str(b.get("price","0"))
+                                s = float(b.get("size",0))
+                                if float(p)>0 and s>0: bk.bids[p] = s
+                            for a in data.get("asks", []):
+                                p = str(a.get("price","0"))
+                                s = float(a.get("size",0))
+                                if float(p)>0 and s>0: bk.asks[p] = s
+                            bk.ts = time.time()
+                            self.books[tid] = bk
                     except: pass
                 await asyncio.sleep(0.2)
             await asyncio.sleep(15)
 
-    async def _refresh_loop(self):
+    async def _refresh_loop(self, session):
         while self._running:
             await asyncio.sleep(120)
-            if self._running: self.refresh()
+            if self._running: await self.refresh(session)
 
     def stop(self):
         self._running = False

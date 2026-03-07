@@ -19,7 +19,7 @@ def create_app(bot):
         for br in bot.feed.get_brackets():
             bk = bot.feed.get_book(br.yes_tid)
             if bk and bk.bb():
-                bids[br.strike] = bk.bb()
+                bids[(br.strike, br.end_ts)] = bk.bb()
         return bids
 
     @app.route("/")
@@ -55,7 +55,7 @@ def create_app(bot):
         now = time.time()
         result = []
         for pos in t.open_positions():
-            bid = bids.get(pos.strike, pos.entry_price)
+            bid = bids.get((pos.strike, pos.end_ts), pos.entry_price)
             pnl_usd = (bid - pos.entry_price) * pos.tokens
             pnl_pct = (pnl_usd / pos.cost_usd * 100) if pos.cost_usd > 0 else 0
             pot_pnl = (pos.tokens * 1.0) - pos.cost_usd  # potential if resolves YES at $1
@@ -100,29 +100,44 @@ def create_app(bot):
 
     @app.route("/api/brackets")
     def api_brackets():
-        feed = bot.feed
-        oracle_data = bot.oracle.latest if bot.oracle else {}
+        from quant_engine import calculate_nd2
+        from datetime import datetime, timezone
+        feed   = bot.feed
+        oracle = bot.oracle
+        now_ts = time.time()
+        spot   = oracle.spot_price if oracle else 0
         result = []
         for br in feed.get_brackets():
             ybk = feed.get_book(br.yes_tid)
-            p_data = {}
-            for ed in oracle_data.values():
-                pd = ed.get("probabilities", {}).get(br.strike)
-                if pd: p_data = pd; break
             y_ask = ybk.ba() if ybk else None
-            p_real = p_data.get("p_real_yes")
+            y_bid = ybk.bb() if ybk else None
+
+            # Per-bracket IV and p_real (strict 1-to-1 expiry mapping)
+            p_real = None
+            iv_pct = None
+            exp_code = None
+            if oracle and spot > 0 and br.end_ts > now_ts:
+                t_years = (br.end_ts - now_ts) / 31_536_000.0
+                target_dt = datetime.fromtimestamp(br.end_ts, tz=timezone.utc)
+                iv, code = oracle.get_iv_for_date(target_dt, br.strike)
+                if iv and iv > 0 and t_years > 0:
+                    p_real   = round(calculate_nd2(spot, br.strike, t_years, iv), 4)
+                    iv_pct   = round(iv * 100, 1)
+                    exp_code = code
+
             edge_pct = round((p_real - y_ask) * 100, 2) if (p_real and y_ask) else None
             result.append({
-                "strike": br.strike,
-                "event": br.event_title[:40],
-                "end_ts": br.end_ts,
-                "y_bid": round(ybk.bb(), 4) if ybk and ybk.bb() else None,
-                "y_ask": round(y_ask, 4) if y_ask else None,
+                "strike":    br.strike,
+                "event":     br.event_title[:40],
+                "end_ts":    br.end_ts,
+                "y_bid":     round(y_bid, 4) if y_bid else None,
+                "y_ask":     round(y_ask, 4) if y_ask else None,
                 "spread_pct": round(ybk.spread() * 100, 1) if ybk and ybk.spread() else None,
-                "p_real": round(p_real, 4) if p_real else None,
-                "edge_pct": edge_pct,
-                "iv_pct": round(p_data["mark_iv"] * 100, 1) if p_data.get("mark_iv") else None,
-                "book_age": round(time.time() - ybk.ts, 0) if ybk and ybk.ts > 0 else None,
+                "p_real":    p_real,
+                "edge_pct":  edge_pct,
+                "iv_pct":    iv_pct,
+                "exp_code":  exp_code,
+                "book_age":  round(time.time() - ybk.ts, 0) if ybk and ybk.ts > 0 else None,
             })
         return jsonify(result)
 
@@ -424,7 +439,7 @@ async function poll() {
         const isOpen = h.event_type === 'OPEN';
         const pnl = parseFloat(h.realized_pnl_usd || 0);
         return `<tr>
-          <td class="text-slate-500 text-xs font-mono">${(h.timestamp||'').slice(11,19)}</td>
+          <td class="text-slate-500 text-xs font-mono whitespace-nowrap">${h.timestamp ? (() => { const d = new Date(h.timestamp); return d.toLocaleDateString('en-GB', {timeZone:'Asia/Bangkok', day:'2-digit', month:'short'}) + ' ' + d.toLocaleTimeString('en-GB', {timeZone:'Asia/Bangkok'}); })() : '—'}</td>
           <td class="text-xs max-w-[120px] truncate text-slate-400">${h.event_name||''}</td>
           <td>${isOpen
             ? '<span style="color:#60a5fa;font-size:10px;background:rgba(96,165,250,.1);padding:1px 6px;border-radius:4px">OPEN</span>'

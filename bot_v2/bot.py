@@ -23,6 +23,13 @@ from feeds import DeribitOracle, PolymarketFeed
 from quant_engine import (
     calculate_nd2, build_state_probabilities, build_returns_matrix,
     frank_wolfe_optimizer, evaluate_execution, evaluate_exit, _ok,
+    get_position_cap,
+)
+from config import (
+    MAX_GLOBAL_EXPOSURE, MAX_EXPOSURE_PER_DATE, KELLY_FRACTION,
+    MIN_EXECUTION_WEIGHT, MIN_TRADE_USD as CFG_MIN_TRADE,
+    MAX_PRICE_DEVIATION as CFG_PRICE_DEV,
+    MIN_ASK_LIQUIDITY_USD as CFG_MIN_LIQ,
 )
 from paper_trader import PaperTrader
 from dashboard import create_app
@@ -35,14 +42,14 @@ ORACLE_POLL_SEC = 5
 DASHBOARD_HOST = "127.0.0.1"
 DASHBOARD_PORT = 5555
 
-# Risk Management Rules
-MAX_TOTAL_EXPOSURE = 0.30    # Rule 1: 30% max exposure
-MAX_OPEN_POSITIONS = 3       # Rule 2: max 3 strikes
-MIN_TRADE_USD = 5.0          # Rule 3: $5 minimum
-
-# Book Sanity Rules
-MAX_PRICE_DEVIATION = 0.35   # reject if |ask - p_real| > 35c (stale book)
-MIN_ASK_LIQUIDITY_USD = 20.0 # reject if ask-side depth < $20 (too thin)
+# Risk Management Rules — values sourced from config.py (3D Risk Matrix)
+# MAX_GLOBAL_EXPOSURE    = 0.30  (from config)
+# MAX_EXPOSURE_PER_DATE  = 0.15  (from config)
+# KELLY_FRACTION         = 0.15  (from config)
+# Probability-tiered caps: 5% / 3% / 1.5% via get_position_cap()
+MIN_TRADE_USD         = CFG_MIN_TRADE     # $5 minimum
+MAX_PRICE_DEVIATION   = CFG_PRICE_DEV     # 35c stale-book guard
+MIN_ASK_LIQUIDITY_USD = CFG_MIN_LIQ       # $20 minimum ask depth
 
 # ===================== LOGGING =======================================
 logging.basicConfig(
@@ -68,22 +75,12 @@ class TradingBot:
         log.info("  QUANT ARB ENGINE — Paper Trading v2")
         log.info("  Capital: $%.2f | Buffer: %.1f%% | Discount: %.1f%%/day",
                  self.trader.initial_capital, MODEL_BUFFER*100, TIME_DISCOUNT_RATE*100)
-        log.info("  Risk: %.0f%% exposure | %d max pos | $%.0f min trade",
-                 MAX_TOTAL_EXPOSURE*100, MAX_OPEN_POSITIONS, MIN_TRADE_USD)
+        log.info("  Risk: %.0f%% global | %.0f%% per-date | Kelly=%.0f%% | $%.0f min",
+                 MAX_GLOBAL_EXPOSURE*100, MAX_EXPOSURE_PER_DATE*100,
+                 KELLY_FRACTION*100, MIN_TRADE_USD)
         log.info("=" * 60)
 
-        # Discover brackets
-        log.info("Discovering Polymarket brackets...")
-        if not self.feed.refresh():
-            log.warning("No brackets found. Will retry.")
-
-        # Build oracle targets from brackets
-        targets = defaultdict(set)
-        for br in self.feed.brackets:
-            targets[br.end_ts].add(br.strike)
-        self.oracle.update_targets(dict(targets))
-        log.info("Oracle targets: %d expiries, %d total strikes",
-                 len(targets), sum(len(s) for s in targets.values()))
+        log.info("Starting feeds and engines...")
 
         # Start dashboard in daemon thread
         app = create_app(self)
@@ -112,6 +109,12 @@ class TradingBot:
 
         while True:
             try:
+                # Dynamically update oracle targets based on latest discovered brackets
+                targets = defaultdict(set)
+                for br in self.feed.brackets:
+                    targets[br.end_ts].add(br.strike)
+                self.oracle.update_targets(dict(targets))
+
                 await self._resolve_expired()
                 await self._evaluate()
             except asyncio.CancelledError:
@@ -131,128 +134,125 @@ class TradingBot:
                 await self.trader.resolve_position(pos, btc)
 
     async def _evaluate(self):
-        """Main evaluation: Risk checks -> Quant Engine -> Execute."""
-        oracle_data = self.oracle.latest
-        if not oracle_data:
+        """Main evaluation: Risk checks -> Per-Bracket IV -> Quant Engine -> Execute.
+
+        STRICT PER-BRACKET T_YEARS AND IV:
+          t_years = (br.end_ts - now) / SECS            (this bracket's exact time)
+          iv      = oracle.get_iv_for_date(target_dt, strike) (this bracket's Deribit IV)
+          p_real  = calculate_nd2(spot, strike, t_years, iv)  (this bracket's probability)
+        """
+        spot = self.oracle.spot_price
+        if not spot or spot <= 0:
             return
 
         brackets = self.feed.get_brackets()
         if not brackets:
             return
 
-        # Get current bids for mark-to-market
+        now_ts = datetime.now(timezone.utc).timestamp()
+
+        # current bids for mark-to-market
         current_bids = {}
         for br in brackets:
             bk = self.feed.get_book(br.yes_tid)
             if bk and bk.bb():
-                current_bids[br.strike] = bk.bb()
+                current_bids[(br.strike, br.end_ts)] = bk.bb()
 
-        # RULE 1: Global Exposure Check (includes pending makers!)
-        open_value = self.trader.open_positions_value(current_bids)
-        pending_value = getattr(self.trader, 'pending_makers_value', lambda: 0)()
-        exposure_ratio = (open_value + pending_value) / self.trader.initial_capital
-        if exposure_ratio >= MAX_TOTAL_EXPOSURE:
-            return  # silently skip — 70% must stay untouchable
+        # RULE 1: Global Exposure Check (Dimension 1)
+        open_value    = self.trader.open_positions_value(current_bids)
+        pending_value = self.trader.pending_makers_value()
+        if (open_value + pending_value) / self.trader.initial_capital >= MAX_GLOBAL_EXPOSURE:
+            return
 
-        # RULE 2: Max Positions Check
-        open_strikes = self.trader.open_strikes()
-        if len(open_strikes) >= MAX_OPEN_POSITIONS:
-            return  # already holding max strikes
+        equity = self.trader.total_equity(current_bids)
 
-        # Group brackets by expiry
-        groups = defaultdict(list)
+        # PASS 1: compute t_years, iv, p_real INDIVIDUALLY per bracket
+        bd = {}  # (strike, end_ts) -> {p_real, iv, t_years, exp_code, br}
         for br in brackets:
-            groups[br.end_ts].append(br)
-
-        for end_ts, group_brackets in groups.items():
-            exp_data = oracle_data.get(end_ts)
-            if not exp_data:
+            if br.end_ts <= now_ts:
                 continue
-
-            spot = exp_data.get("spot_price", 0)
-            probs = exp_data.get("probabilities", {})
-            if not probs:
+            t_years = (br.end_ts - now_ts) / 31_536_000.0
+            if t_years <= 0:
                 continue
+            target_dt = datetime.fromtimestamp(br.end_ts, tz=timezone.utc)
+            iv, exp_code = self.oracle.get_iv_for_date(target_dt, br.strike)
+            if iv is None or iv <= 0:
+                continue
+            p_real = calculate_nd2(spot, br.strike, t_years, iv)
+            if not _ok(p_real):
+                continue
+            bd[(br.strike, br.end_ts)] = dict(
+                p_real=p_real, iv=iv, t_years=t_years, exp_code=exp_code, br=br)
 
-            # Build P(YES) map: only valid strikes
+        if not bd:
+            return
+
+        # PASS 2: group by end_ts for Frank-Wolfe
+        groups = defaultdict(list)
+        for (strike, end_ts), info in bd.items():
+            groups[end_ts].append((strike, info))
+
+        for end_ts, items in groups.items():
             strike_probs = {}
             entry_prices = {}
+            info_map     = {}
 
-            for br in group_brackets:
-                prob_data = probs.get(br.strike)
-                if not prob_data:
-                    continue
-                p_yes = prob_data.get("p_real_yes")
-                iv = prob_data.get("mark_iv")
-                if not _ok(p_yes) or not _ok(iv):
-                    continue
-
+            for strike, info in items:
+                br  = info["br"]
                 ybk = self.feed.get_book(br.yes_tid)
-                if not ybk:
-                    continue
+                if not ybk: continue
                 ask = ybk.ba()
-                bid = ybk.bb()
-                if not ask or ask <= 0:
-                    continue
-
-                strike_probs[br.strike] = p_yes
-                entry_prices[br.strike] = ask  # worst-case entry = ask
+                if not ask or ask <= 0: continue
+                strike_probs[strike] = info["p_real"]
+                entry_prices[strike] = ask
+                info_map[strike]     = info
 
             if not strike_probs:
                 continue
 
-            # Run Frank-Wolfe
             try:
-                p_states, _ = build_state_probabilities(strike_probs)
+                p_states, _  = build_state_probabilities(strike_probs)
                 strikes_list = sorted(strike_probs.keys())
-                R = build_returns_matrix(strikes_list, entry_prices)
-                weights = frank_wolfe_optimizer(p_states, R)
+                R            = build_returns_matrix(strikes_list, entry_prices)
+                weights      = frank_wolfe_optimizer(p_states, R)
             except Exception as e:
                 log.warning("Optimizer: %s", e)
                 continue
-
-            # Evaluate each strike
-            equity = self.trader.total_equity(current_bids)
 
             for i, strike in enumerate(strikes_list):
                 weight = weights[i] if i < len(weights) else 0
                 if weight < 0.001:
                     continue
 
-                # Re-check RULE 2 (may have filled during this loop)
-                if len(self.trader.open_strikes()) >= MAX_OPEN_POSITIONS:
-                    break
-
-                # Skip if already holding this strike+expiry
-                already = any(p.strike == strike and p.end_ts == end_ts
-                              for p in self.trader.positions)
-                if already:
+                # Skip if already holding OR pending for this strike+expiry
+                already_open = any(
+                    p.strike == strike and p.end_ts == end_ts
+                    for p in self.trader.positions
+                )
+                already_pending = any(
+                    o["strike"] == strike and o["end_ts"] == end_ts
+                    for o in self.trader.pending_makers
+                )
+                if already_open or already_pending:
                     continue
 
-                prob_data = probs.get(strike)
-                if not prob_data:
-                    continue
-                p_real = prob_data["p_real_yes"]
-
-                br = next((b for b in group_brackets if b.strike == strike), None)
-                if not br:
-                    continue
+                info   = info_map.get(strike)
+                if not info: continue
+                p_real = info["p_real"]
+                iv     = info["iv"]
+                br     = info["br"]
 
                 ybk = self.feed.get_book(br.yes_tid)
-                if not ybk:
-                    continue
+                if not ybk: continue
                 best_bid = ybk.bb()
                 best_ask = ybk.ba()
                 ask_size = ybk.ba_size()
 
-                action, target_price = evaluate_execution(
-                    p_real, best_bid, best_ask, MODEL_BUFFER)
-
+                action, target_price, avail_size = evaluate_execution(
+                    p_real, best_bid, best_ask, MODEL_BUFFER, ask_size)
                 if action == "SKIP_TRADE":
                     continue
 
-                # SANITY: Cross-validate book price vs oracle P(real)
-                # If they diverge >35c the book is stale/corrupted
                 if abs(target_price - p_real) > MAX_PRICE_DEVIATION:
                     self.trader._add_log(
                         f"SKIP | ${strike:,} | STALE BOOK "
@@ -260,40 +260,72 @@ class TradingBot:
                         f"diff={abs(target_price-p_real):.3f}")
                     continue
 
-                # SANITY: Minimum ask-side liquidity for takers
                 if action == "TAKER_FAK":
-                    ask_liq_usd = (ask_size or 0) * (best_ask or 0)
-                    if ask_liq_usd < MIN_ASK_LIQUIDITY_USD:
+                    ask_liq = (ask_size or 0) * (best_ask or 0)
+                    if ask_liq < MIN_ASK_LIQUIDITY_USD:
                         self.trader._add_log(
-                            f"SKIP | ${strike:,} | THIN BOOK "
-                            f"depth=${ask_liq_usd:.1f} < ${MIN_ASK_LIQUIDITY_USD}")
+                            f"SKIP | ${strike:,} | THIN BOOK depth=${ask_liq:.1f}")
                         continue
 
-                allocation_usd = equity * weight
-                allocation_usd = min(allocation_usd, self.trader.capital * 0.3)
+                # ── 3D RISK MATRIX SIZING ────────────────────────────────────
+                initial_cap = self.trader.initial_capital
 
-                # Liquidity cap for takers
+                # Step A: Fractional Kelly de-leveraging
+                adjusted_kelly = weight * KELLY_FRACTION
+
+                # Step B: Probability-tiered cap
+                tier_cap      = get_position_cap(p_real)
+                target_weight = min(adjusted_kelly, tier_cap)
+
+                # Step C: Portfolio gates
+                # Gate 1 — global exposure remaining
+                current_global = (open_value + pending_value) / initial_cap
+                allowed_global = max(0.0, MAX_GLOBAL_EXPOSURE - current_global)
+
+                # Gate 2 — per-date correlation defence
+                target_date = datetime.fromtimestamp(end_ts, tz=timezone.utc).date()
+                date_value  = sum(
+                    pos.cost_usd for pos in self.trader.open_positions()
+                    if datetime.fromtimestamp(pos.end_ts, tz=timezone.utc).date() == target_date
+                ) + sum(
+                    o["allocation_usd"] for o in self.trader.pending_makers
+                    if datetime.fromtimestamp(o["end_ts"], tz=timezone.utc).date() == target_date
+                )
+                current_date = date_value / initial_cap
+                allowed_date = max(0.0, MAX_EXPOSURE_PER_DATE - current_date)
+
+                # Final clamped weight
+                final_weight = min(target_weight, allowed_global, allowed_date)
+
+                if final_weight <= MIN_EXECUTION_WEIGHT:
+                    continue   # dust — not worth the API call
+
+                allocation_usd = equity * final_weight
+
+                # Hard liquidity cap for takers
                 if action == "TAKER_FAK" and best_ask:
-                    max_liq = ask_size * best_ask
-                    allocation_usd = min(allocation_usd, max_liq)
+                    allocation_usd = min(allocation_usd, ask_size * best_ask)
 
-                # RULE 3: Minimum trade size
                 if allocation_usd < MIN_TRADE_USD:
                     continue
+                # ── END 3D RISK MATRIX ────────────────────────────────────────
 
-                # Log signal
                 edge = (p_real - best_ask) if best_ask else 0
                 self.trader._add_log(
                     f"SIGNAL | ${strike:,} | edge={edge:.4f} | "
-                    f"w={weight:.3f} | ${allocation_usd:.2f} | {action}")
+                    f"kelly={weight:.3f}→{final_weight:.3f} | "
+                    f"${allocation_usd:.2f} | {action} | "
+                    f"T={info['t_years']*365:.1f}d iv={iv*100:.1f}% "
+                    f"[{info['exp_code']}] tier={tier_cap*100:.1f}%")
 
-                # RULE 4: Execute under lock
-                entry_reason = f"edge={edge*100:.1f}% w={weight:.3f} iv={prob_data.get('mark_iv',0)*100:.1f}%"
+                entry_reason = (f"edge={edge*100:.1f}% kelly={weight:.3f}→{final_weight:.3f} "
+                                f"iv={iv*100:.1f}% T={info['t_years']*365:.1f}d "
+                                f"deribit={info['exp_code']} tier={tier_cap*100:.1f}%")
                 if action == "TAKER_FAK":
                     await self.trader.submit_taker(
                         strike, target_price, allocation_usd, end_ts,
                         event_title=br.event_title, entry_reason=entry_reason,
-                        edge=edge, book=ybk)
+                        edge=edge, book=ybk, ask_size=avail_size)
                 elif action == "MAKER_POST_ONLY":
                     await self.trader.submit_maker(
                         strike, target_price, allocation_usd, end_ts,
@@ -310,15 +342,19 @@ class TradingBot:
             if not br:
                 continue
 
-            exp_data = oracle_data.get(br.end_ts)
-            if not exp_data:
+            # Per-bracket p_real for Smart TP
+            target_dt = datetime.fromtimestamp(br.end_ts, tz=timezone.utc)
+            now_ts_tp = datetime.now(timezone.utc).timestamp()
+            t_years_tp = max(0, (br.end_ts - now_ts_tp) / 31_536_000.0)
+            iv_tp, _ = self.oracle.get_iv_for_date(target_dt, pos.strike)
+            if iv_tp is None or iv_tp <= 0:
                 continue
-
-            prob_data = exp_data.get("probabilities", {}).get(pos.strike)
-            if not prob_data:
+            spot_tp = self.oracle.spot_price
+            if not spot_tp or spot_tp <= 0:
                 continue
-
-            p_real = prob_data["p_real_yes"]
+            p_real = calculate_nd2(spot_tp, pos.strike, t_years_tp, iv_tp)
+            if not _ok(p_real):
+                continue
             end_dt = datetime.fromtimestamp(br.end_ts, tz=timezone.utc)
             days_remaining = max(0, (end_dt - now).total_seconds() / 86400)
 

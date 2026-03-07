@@ -41,6 +41,24 @@ def _ok(v):
         return False
 
 
+def get_position_cap(p_real: float) -> float:
+    """
+    Probability-tiered position cap (Dimension 3 of 3D Risk Matrix).
+
+    Returns the maximum fraction of initial_capital allowed for this
+    position, based on the model's win probability:
+      p_real > 0.80  → deep ITM, high conviction  → 5.0% cap
+      p_real > 0.40  → standard / mid-range       → 3.0% cap
+      else           → lotto / deep OTM            → 1.5% cap
+    """
+    if p_real > 0.80:
+        return 0.050   # High Confidence: Max 5%
+    elif p_real > 0.40:
+        return 0.030   # Standard: Max 3%
+    else:
+        return 0.015   # Lotto/High-Variance: Max 1.5%
+
+
 # =====================================================================
 # PHASE 2 - Frank-Wolfe Kelly Optimisation
 # =====================================================================
@@ -103,37 +121,80 @@ def frank_wolfe_optimizer(p_states, R_matrix, max_iter=5000, tol=1e-6):
 # PHASE 3 - Hybrid Execution Logic
 # =====================================================================
 
-def evaluate_execution(p_real, best_bid, best_ask, model_buffer=0.02):
-    """Returns (action, target_price)."""
+def evaluate_execution(p_real, best_bid, best_ask, model_buffer=0.02, ask_size=0.0):
+    """Returns (action, target_price, available_size)."""
     if not _ok(p_real) or not _ok(best_bid) or not _ok(best_ask):
-        return ("SKIP_TRADE", 0.0)
+        return ("SKIP_TRADE", 0.0, 0.0)
     if best_ask <= 0 or best_bid <= 0:
-        return ("SKIP_TRADE", 0.0)
+        return ("SKIP_TRADE", 0.0, 0.0)
     spread = max(0.0, best_ask - best_bid)
     dyn_thresh = spread + model_buffer
     if p_real - best_ask >= dyn_thresh:
-        return ("TAKER_FAK", best_ask)
+        return ("TAKER_FAK", best_ask, ask_size)
     elif p_real - (best_bid + 0.001) >= model_buffer:
-        return ("MAKER_POST_ONLY", best_bid + 0.001)
+        return ("MAKER_POST_ONLY", best_bid + 0.001, 0.0)
     else:
-        return ("SKIP_TRADE", 0.0)
+        return ("SKIP_TRADE", 0.0, 0.0)
 
 
 # =====================================================================
 # PHASE 4 - Smart Take-Profit
 # =====================================================================
 
+CAPITAL_RECYCLING_THRESHOLD = 0.99
+
 def evaluate_exit(p_real, best_bid, bid_size, tokens_held, days_remaining,
                   entry_price, time_discount_rate=0.01):
-    """Returns (action, optimal_tp, reason)."""
+    """
+    Returns (action, optimal_tp, reason).
+
+    Exit pipeline (strictest priority first):
+      1. Capital Recycling    — bid >= 0.99  -> sell instantly
+      2. Dynamic Greed Decay  — exponential trailing TP scaled to entry price
+      3. Standard Time-Decay  — p_real minus time-remaining discount
+      4. Hold
+    """
+    import math
+
     optimal_tp = p_real - (days_remaining * time_discount_rate)
+
+    # Guard: need a valid bid to do anything useful
     if not _ok(best_bid) or best_bid <= 0:
         return ("HOLD", optimal_tp, "no_bid")
+
+    # ── 1. CAPITAL RECYCLING (always fires first) ─────────────────────────
+    if best_bid >= CAPITAL_RECYCLING_THRESHOLD:
+        return ("MARKET_SELL", best_bid, "CAPITAL_RECYCLING")
+
+    # ── 2. DYNAMIC GREED DECAY TP ─────────────────────────────────────────
+    #
+    # dynamic_target = p_real * exp(-k * max(0, ROI))
+    #
+    # Dynamic k scales with entry_price:
+    #   $0.033 entry  ->  k = 0.15  (slow decay, patient for 10x+)
+    #   $0.10  entry  ->  k = 0.25  (medium,     locks 2-3x)
+    #   $0.80  entry  ->  k = 1.30  (aggressive, secures 50% gain)
+    #
+    # Trigger requires: bid >= dynamic_target AND roi > 40%
+    # (prevents noise selling on deep-OTM options)
+    if _ok(entry_price) and entry_price > 0:
+        current_roi    = (best_bid - entry_price) / entry_price
+        dynamic_k      = 0.10 + (entry_price * 1.5)
+        dynamic_target = p_real * math.exp(-dynamic_k * max(0.0, current_roi))
+
+        if current_roi > 0.40 and best_bid >= dynamic_target:
+            return (
+                "MARKET_SELL", best_bid,
+                f"DYNAMIC_GREED_TP (+{current_roi*100:.0f}% k={dynamic_k:.3f} tgt={dynamic_target:.3f})"
+            )
+
+    # ── 3. STANDARD TIME-DECAY TP ─────────────────────────────────────────
     if best_bid < entry_price:
         return ("HOLD", optimal_tp, "below_entry")
     if best_bid >= optimal_tp and bid_size >= tokens_held:
         return ("MARKET_SELL", optimal_tp, "tp_hit_liquid")
     elif best_bid >= optimal_tp:
         return ("HOLD", optimal_tp, "tp_hit_thin_book")
-    else:
-        return ("HOLD", optimal_tp, "below_tp")
+
+    # ── 4. HOLD ───────────────────────────────────────────────────────────
+    return ("HOLD", optimal_tp, "below_tp")

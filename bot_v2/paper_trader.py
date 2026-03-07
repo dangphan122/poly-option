@@ -90,12 +90,18 @@ class PaperTrader:
     def open_strikes(self):
         return set(p.strike for p in self.open_positions())
 
+    def _get_bid(self, current_bids, pos):
+        # Dashboard/Bot pass (strike, end_ts), fallback to strike alone
+        if (pos.strike, pos.end_ts) in current_bids:
+            return current_bids[(pos.strike, pos.end_ts)]
+        return current_bids.get(pos.strike, pos.entry_price)
+
     def open_positions_value(self, current_bids):
-        return sum(pos.tokens * current_bids.get(pos.strike, pos.entry_price)
+        return sum(pos.tokens * self._get_bid(current_bids, pos)
                    for pos in self.open_positions())
 
     def unrealized_pnl(self, current_bids):
-        return sum((current_bids.get(pos.strike, pos.entry_price) - pos.entry_price) * pos.tokens
+        return sum((self._get_bid(current_bids, pos) - pos.entry_price) * pos.tokens
                    for pos in self.open_positions())
 
     def realized_pnl(self):
@@ -131,27 +137,37 @@ class PaperTrader:
 
     # --- Order Submission ---
     async def submit_taker(self, strike, price, allocation_usd, end_ts,
-                           event_title="", entry_reason="", edge=0.0, book=None):
+                           event_title="", entry_reason="", edge=0.0, book=None,
+                           ask_size=0.0):
         if not self.book_is_valid(book):
             self._add_log(f"SKIP TAKER | ${strike:,} | book invalid/stale/thin")
             return None
         async with self.trade_lock:
-            alloc = min(allocation_usd, self.capital)
-            if alloc < 0.01:
+            # Desired buy logic
+            desired_alloc = min(allocation_usd, self.capital)
+            if desired_alloc < 0.01:
                 return None
-            tokens = alloc / price
-            self.capital -= alloc
+            desired_tokens = desired_alloc / price
+            
+            # STRICT SIZE ENFORCEMENT
+            filled_tokens = min(desired_tokens, ask_size) if ask_size > 0 else desired_tokens
+            if filled_tokens < 0.01:
+                self._add_log(f"SKIP TAKER | ${strike:,} | ask_size too small for fill")
+                return None
+
+            filled_alloc = filled_tokens * price
+            self.capital -= filled_alloc
             pos = Position(
                 id=str(uuid.uuid4())[:8],
                 strike=strike, side="YES", order_type="TAKER_FAK",
-                entry_price=price, tokens=tokens, cost_usd=alloc,
+                entry_price=price, tokens=filled_tokens, cost_usd=filled_alloc,
                 end_ts=end_ts, opened_at=time.time(),
                 event_title=event_title, entry_reason=entry_reason,
                 edge_at_entry=edge)
             self.positions.append(pos)
             self._add_log(
                 f"BUY TAKER | {event_title or f'${strike:,}'} | "
-                f"{tokens:.1f}tok @ {price:.4f} | ${alloc:.2f} | {entry_reason}")
+                f"{filled_tokens:.1f}tok @ {price:.4f} (max_avail={ask_size:.1f}) | ${filled_alloc:.2f} | {entry_reason}")
             self._csv_open(pos)
             return pos
 
